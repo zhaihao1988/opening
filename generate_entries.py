@@ -86,7 +86,7 @@ def execute_raw_query(sql_query, description):
 
 # --- Data Processing Functions ---
 
-def process_direct_business(df_direct):
+def process_direct_business(df_direct, filter_enabled=False):
     """
     Processes direct business data to generate accounting entries.
     """
@@ -109,6 +109,7 @@ def process_direct_business(df_direct):
         {'类型': '亏损(保费不足)', '借贷方向': '贷', 'I17科目代码': '2606011202', '取数口径': '正数', '金额来源': '亏损部分', '符号': 1},
         {'类型': '计息', '借贷方向': '贷', 'I17科目代码': '2606011302', '取数口径': '正数', '金额来源': 'IACF计息', '符号': 1},
     ]
+    skip_codes_when_filtered = {'2606010801', '2606011002'}
     
     measure_dimension_cols = ['归属机构', '业务渠道', '车辆种类', '使用性质代码', '合同分组编号', '险种代码', '险类代码', '合同组合编号']
     all_entries = []
@@ -118,13 +119,16 @@ def process_direct_business(df_direct):
             print(f"警告：在直保数据中找不到源列 '{rule['金额来源']}'，跳过规则 '{rule['类型']}'。")
             continue
 
-        temp_df = df_direct[measure_dimension_cols].copy()
+        # 起期>20241231的保单已在WHERE条件中排除，直接使用聚合结果生成分录
+        source_df = df_direct
+
+        temp_df = source_df[measure_dimension_cols].copy()
         temp_df['类型'] = rule['类型']
         temp_df['借贷方向'] = rule['借贷方向']
         temp_df['I17科目代码'] = rule['I17科目代码']
         temp_df['I17科目名称'] = i17_names.get(rule['I17科目代码'])
         temp_df['取数口径'] = rule['取数口径']
-        temp_df['金额'] = df_direct[rule['金额来源']] * rule['符号']
+        temp_df['金额'] = source_df[rule['金额来源']] * rule['符号']
         
         all_entries.append(temp_df)
         
@@ -149,6 +153,7 @@ def process_assumed_reinsurance(df_assumed):
         '2606010913': '未到期责任负债-未来现金流-现金流/分入保费-分保费用/比例临分',
         '2606010921': '未到期责任负债-未来现金流-现金流/分入保费-分保费用/经纪费/比例合同',
         '2606010923': '未到期责任负债-未来现金流-现金流/分入保费-分保费用/经纪费/比例临分',
+        '2606010990': '未到期责任负债-未来现金流-现金流/分入保费-分保费用/业务及管理费结转',
         '2606011101': '未到期责任负债-未来现金流-保费分配法分摊的收入-保费收入/分入业务',
         '2606011602': '未到期责任负债-未来现金流-获取费用摊销计入支出-保费分配法/分入业务',
         '2606011301': '未到期责任负债-未来现金流-保险财务费用-当期计提利息/保费分配法/分入业务',
@@ -162,6 +167,7 @@ def process_assumed_reinsurance(df_assumed):
         {'类型': '分保费收入', '金额来源': '分保费收入', '符号': 1, '取数口径': '正数', 'contract_code': '2606010901', 'facultative_code': '2606010904'},
         {'类型': '分保费用', '金额来源': '分保费用', '符号': -1, '取数口径': '负数', 'contract_code': '2606010911', 'facultative_code': '2606010913'},
         {'类型': '经纪费', '金额来源': '经纪费', '符号': -1, '取数口径': '负数', 'contract_code': '2606010921', 'facultative_code': '2606010923'},
+        {'类型': '业务及管理费结转', '金额来源': '业务及管理费结转', '符号': -1, '取数口径': '负数', 'code': '2606010990'},
         {'类型': '已经过保费', '金额来源': ['预收净保费摊销', '累积计息摊销'], '符号': -1, '取数口径': '负数', 'code': '2606011101'},
         {'类型': '获取费用摊销', '金额来源': '获取费用摊销', '符号': 1, '取数口径': '正数', 'code': '2606011602'},
         {'类型': '亏损', '金额来源': '亏损部分', '符号': 1, '取数口径': '正数', 'code': '2606011201'},
@@ -387,11 +393,71 @@ def transform_to_final_format(df, insurance_type, mappings):
 
 # --- Main Execution Logic ---
 
+def build_filter_condition(table_name, val_method, filter_enabled=True, sign_year='2024', start_month='202501'):
+    """
+    构建过滤条件：排除签单年在指定年份且起期在指定月份的数据
+    
+    Args:
+        table_name: 表名（用于判断是直保还是再保）
+        val_method: 评估方法（'8'=直保, '10'=分出, '11'=分入）
+        filter_enabled: 是否启用过滤
+        sign_year: 签单年份
+        start_month: 起期月份（格式：yyyyMM）
+    
+    Returns:
+        SQL条件字符串
+    """
+    # 分入业务（val_method=11）不做筛选
+    if val_method == '11' or not filter_enabled:
+        return ""
+    
+    if 'measure_cx_unexpired' in table_name:
+        # 直保：ini_confirm是yyyy-mm-dd格式，start_date是yyyy-mm-dd格式
+        # 签单年2024且起期在2025年1月的数据要排除
+        start_year = start_month[:4]  # 从'202501'提取'2025'
+        start_month_num = start_month[4:6]  # 从'202501'提取'01'
+        next_month = f"{int(start_month_num) + 1:02d}"  # 计算下一个月'02'
+        return f"""
+        AND NOT (
+            LEFT("ini_confirm", 4) = '{sign_year}'
+            AND "start_date" >= '{start_year}-{start_month_num}-01'
+            AND "start_date" < '{start_year}-{next_month}-01'
+        )
+        """
+    else:
+        # 再保（分出）：under_write_date/certi_write_date是yyyymmdd格式，start_date是yyyymmdd格式
+        # 签单年2024且起期在2025年1月的数据要排除
+        start_date_begin = start_month + '01'  # 如：20250101
+        start_date_end = start_month + '32'    # 如：20250132（用于 < 比较）
+        return f"""
+        AND NOT (
+            (
+                ("certi_no" IS NULL OR "certi_no" = '') AND LEFT("under_write_date", 4) = '{sign_year}'
+                OR
+                ("certi_no" IS NOT NULL AND "certi_no" != '') AND LEFT("certi_write_date", 4) = '{sign_year}'
+            )
+            AND "start_date" >= '{start_date_begin}'
+            AND "start_date" < '{start_date_end}'
+        )
+        """
+
+def build_direct_filter_case(filter_enabled=True):
+    """
+    构建直保过滤条件（CASE表达式用）：当过滤启用时，起期大于20241231的保单不做2606010801和2606011002这两个分录。
+    返回SQL片段，可放入CASE WHEN中。
+    """
+    if not filter_enabled:
+        return "FALSE"
+
+    return "\"start_date\" > '2024-12-31'"
+
 def main():
     """
     Main function to orchestrate the entire process from data extraction to final report generation.
     """
     # --- SQL Queries and Groupby Definitions ---
+    # 注意：起期大于20241231的保单已在WHERE条件中排除，不参与查询和聚合
+
     sql_8 = """
     SELECT
         "com_code" AS "归属机构", "business_nature" AS "业务渠道", "car_kind_code" AS "车辆种类",
@@ -421,6 +487,7 @@ def main():
         SUM("net_premium_amortization") AS "预收净保费摊销",
         SUM("cumulative_ifie_amt_amortization") AS "累积计息摊销",
         SUM("cumulative_no_iacf_amortization") AS "获取费用摊销",
+        SUM("no_iacf_cash_flow") AS "业务及管理费结转",
         SUM("loss_component_allocation") AS "亏损部分",
         SUM("cumulative_ifie_amt") AS "计息"
     """
@@ -453,13 +520,19 @@ def main():
 
     # --- Step 1: Extract data from database and save for checking ---
     print("--- 步骤 1: 开始从数据库提取数据 ---")
-    df_8 = get_data_from_db('8', sql_8, groupby_8, table_name='"measure_platform"."measure_cx_unexpired"', additional_where_clause="AND \"end_date\" > '20241231'")
+    
+    df_8 = get_data_from_db('8', sql_8, groupby_8, table_name='"measure_platform"."measure_cx_unexpired"', 
+                           additional_where_clause='AND "end_date" > \'2024-12-31\' AND "start_date" <= \'2024-12-31\'')
     save_to_excel(df_8, 'measurement_results_8.xlsx')
     
-    df_11 = get_data_from_db('11', sql_11, groupby_11, table_name='"measure_platform"."int_measure_cx_unexpired_rein"', additional_where_clause="AND \"pi_end_date\" > '20241231'")
+    # 分入业务（val_method=11）不做筛选
+    df_11 = get_data_from_db('11', sql_11, groupby_11, table_name='"measure_platform"."int_measure_cx_unexpired_rein"', 
+                            additional_where_clause='AND "end_date" > \'20241231\'')
     save_to_excel(df_11, 'measurement_results_11.xlsx')
     
-    df_10 = get_data_from_db('10', sql_10, groupby_10, table_name='"measure_platform"."int_measure_cx_unexpired_rein"', additional_where_clause="AND \"pi_end_date\" > '20241231'")
+    # 分出业务不做任何额外筛选，只做前两步筛选（val_month='202412' 且 end_date > '20241231'）
+    df_10 = get_data_from_db('10', sql_10, groupby_10, table_name='"measure_platform"."int_measure_cx_unexpired_rein"', 
+                            additional_where_clause='AND "end_date" > \'20241231\'')
     save_to_excel(df_10, 'measurement_results_10.xlsx')
     
     # df_alloc = execute_raw_query(sql_alloc, "分摊结果查询") # No longer needed
@@ -537,7 +610,7 @@ def main():
         return
 
     # Process each business type
-    direct_entries = process_direct_business(df_8)
+    direct_entries = process_direct_business(df_8, filter_enabled=False)
     assumed_entries = process_assumed_reinsurance(df_11)
     ceded_entries = process_ceded_reinsurance(df_10)
     
